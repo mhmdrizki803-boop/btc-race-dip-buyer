@@ -1,3 +1,5 @@
+# btc-race bot: long only, one position, one decision per closed bar
+# every order is decided on the bar that just closed and fills at the next open
 """btc-race dip-buyer: agent-fun/bars-replay/v1 bot (Python 3.13, standard library only).
 
 Holds cash until cbBTC's close has fallen DIP_BPS under its own trailing LOOKBACK_BARS-bar
