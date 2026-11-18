@@ -1,52 +1,84 @@
-# A dip buyer for the cbBTC minute bars: it buys when the close has fallen well under the day's own
-# recent high and sells into the first bounce, holding through the noise in between.
-import os, sys
+"""btc-race dip-buyer: agent-fun/bars-replay/v1 bot (Python 3.13, standard library only).
+
+Holds cash until cbBTC's close has fallen DIP_BPS under its own trailing WINDOW-bar
+high, then buys the whole book; sells into the first TAKE_PROFIT_BPS bounce, on a
+STOP_LOSS_BPS stop, or after MAX_HOLD_BARS bars. Long only, one position, no leverage,
+every decision from the bars alone. The vendor shim owns the wire.
+"""
+
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
-import makefun_bars
+import makefun_bars  # noqa: E402
 
+# --- strategy constants (bps are basis points; 10_000 bps = 100%) ---
+BPS = 10_000
 SYMBOL = "CBBTC"
-REF_BARS = 60
-DIP_BPS = 250
-TAKE_BPS = 120
-STOP_BPS = 50
-MAX_HOLD = 720
-SIZE_BPS = 10000
-CAP_BPS = 100
-MIN_NOTIONAL = 1_000_000
-
-hold = 0
-closes = []
+WINDOW = 60              # keep at most this many of the latest closes
+DIP_BPS = 250            # buy when close is <=2.5% under the trailing high
+TAKE_PROFIT_BPS = 120    # sell when up >=1.2% over cost
+STOP_LOSS_BPS = 50       # sell when down >=0.5% under cost
+MAX_HOLD_BARS = 720      # sell after this many bars held
+MAX_SLIPPAGE_BPS = 100   # every order's max_slippage_bps
 
 
-def on_batch(state, batch):
-    global hold, closes
-    if state.warming_up:
-        return []
-    close = state.close(SYMBOL)
-    if close is None:
-        return []
-    closes.append(close)
-    if len(closes) > REF_BARS:
-        closes = closes[-REF_BARS:]
-    held = state.positions.get(SYMBOL)
-    if held is None:
-        if len(closes) < REF_BARS:
+def make_strategy():
+    closes = []          # the last WINDOW closes of SYMBOL, oldest first
+    bars_held = 0        # bars the current position has been open
+
+    def on_batch(state, batch):
+        nonlocal bars_held
+
+        # Always fold the bar in, even while warming up: warm-up bars build history.
+        close = state.close(SYMBOL)
+        if close is not None:
+            closes.append(close)
+            if len(closes) > WINDOW:
+                del closes[0]
+
+        # Orders decided on a warm-up batch are rejected and never retried: wait.
+        if state.warming_up:
             return []
-        ref = max(closes)
-        if close <= ref * (10000 - DIP_BPS) // 10000:
-            spend = min(state.cash * SIZE_BPS // 10000, state.weight_room(SYMBOL))
-            if spend >= MIN_NOTIONAL:
-                hold = 0
-                return [{"side": "buy", "symbol": SYMBOL, "notional_quote_units": spend,
-                          "max_slippage_bps": CAP_BPS}]
+
+        held = state.positions.get(SYMBOL)
+
+        if held is None:
+            bars_held = 0
+            if not closes:
+                return []
+            high = max(closes)
+            # <=2.5% under the trailing high, in integers.
+            if close is None or close * BPS > high * (BPS - DIP_BPS):
+                return []
+            notional = min(state.cash, state.weight_room(SYMBOL))
+            if notional <= 0:
+                return []
+            return [{
+                "side": "buy",
+                "symbol": SYMBOL,
+                "notional_quote_units": notional,
+                "max_slippage_bps": MAX_SLIPPAGE_BPS,
+            }]
+
+        # Holding: count the bar, then decide on the exit.
+        bars_held += 1
+        value = state.value(SYMBOL, held.qty)
+        gain_bps = (value - held.cost) * BPS // held.cost if held.cost else 0
+        if (
+            gain_bps >= TAKE_PROFIT_BPS
+            or gain_bps <= -STOP_LOSS_BPS
+            or bars_held >= MAX_HOLD_BARS
+        ):
+            return [{
+                "side": "sell",
+                "symbol": SYMBOL,
+                "qty": held.qty,
+                "max_slippage_bps": MAX_SLIPPAGE_BPS,
+            }]
         return []
-    hold += 1
-    gain_bps = (state.value(SYMBOL, held.qty) - held.cost) * 10000 // held.cost if held.cost else 0
-    if gain_bps >= TAKE_BPS or gain_bps <= -STOP_BPS or hold >= MAX_HOLD:
-        return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty, "max_slippage_bps": CAP_BPS}]
-    return []
+
+    return on_batch
 
 
-if __name__ == "__main__":
-    makefun_bars.run(on_batch)
+makefun_bars.run(make_strategy())
