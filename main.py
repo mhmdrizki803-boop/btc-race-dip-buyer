@@ -1,87 +1,74 @@
-# btc-race bot: long only, one position, one decision per closed bar
-# every order is decided on the bar that just closed and fills at the next open
-"""btc-race dip-buyer: agent-fun/bars-replay/v1 bot (Python 3.13, standard library only).
-
-Holds cash until cbBTC's close has fallen DIP_BPS under its own trailing LOOKBACK_BARS-bar
-high, then buys the whole book; sells into the first TAKE_PROFIT_BPS bounce, on a
-STOP_LOSS_BPS stop, or after MAX_HOLD_BARS bars. Long only, one position, no leverage,
-every decision from the bars alone. The vendor shim owns the wire.
-"""
-
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars  # noqa: E402
 
-# --- strategy constants (bps are basis points; 10_000 bps = 100%) ---
-BPS = 10_000
 SYMBOL = "CBBTC"
-# bars of close history the dip is measured against
-LOOKBACK_BARS = 60              # keep at most this many of the latest closes
-DIP_BPS = 250            # buy when close is <=2.5% under the trailing high
-TAKE_PROFIT_BPS = 120    # sell when up >=1.2% over cost
-STOP_LOSS_BPS = 50       # sell when down >=0.5% under cost
-MAX_HOLD_BARS = 720      # sell after this many bars held
-MAX_SLIPPAGE_BPS = 100   # every order's max_slippage_bps
+LOOKBACK_BARS = 60
+DIP_BPS = 250
+TAKE_BPS = 120
+STOP_BPS = 45
+MAX_HOLD_BARS = 720
+CAP_BPS = 100
+MIN_NOTIONAL = 1000000
 
 
-def make_strategy():
-    closes = []          # the last LOOKBACK_BARS closes of SYMBOL, oldest first
-    bars_held = 0        # bars the current position has been open
+class Strategy:
+    def __init__(self):
+        self.closes = []
+        self.bars_held = 0
 
-    def on_batch(state, batch):
-        nonlocal bars_held
+    def on_batch(self, state, batch):
+        return self.decide(state)
 
-        # Always fold the bar in, even while warming up: warm-up bars build history.
+    def decide(self, state):
         close = state.close(SYMBOL)
         if close is not None:
-            closes.append(close)
-            if len(closes) > LOOKBACK_BARS:
-                del closes[0]
+            self.closes.append(close)
+            if len(self.closes) > LOOKBACK_BARS:
+                del self.closes[0]
 
-        # Orders decided on a warm-up batch are rejected and never retried: wait.
         if state.warming_up:
             return []
 
         held = state.positions.get(SYMBOL)
 
         if held is None:
-            bars_held = 0
-            if not closes:
+            self.bars_held = 0
+            if close is None or not self.closes:
                 return []
-            high = max(closes)
-            # <=2.5% under the trailing high, in integers.
-            if close is None or close * BPS > high * (BPS - DIP_BPS):
+            high = max(self.closes)
+            if close > high * (10000 - DIP_BPS) // 10000:
                 return []
             notional = min(state.cash, state.weight_room(SYMBOL))
-            if notional <= 0:
+            if notional < MIN_NOTIONAL:
                 return []
             return [{
                 "side": "buy",
                 "symbol": SYMBOL,
                 "notional_quote_units": notional,
-                "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                "max_slippage_bps": CAP_BPS,
             }]
 
-        # Holding: count the bar, then decide on the exit.
-        bars_held += 1
+        self.bars_held += 1
         value = state.value(SYMBOL, held.qty)
-        gain_bps = (value - held.cost) * BPS // held.cost if held.cost else 0
+        gain_bps = (value - held.cost) * 10000 // held.cost if held.cost else 0
         if (
-            gain_bps >= TAKE_PROFIT_BPS
-            or gain_bps <= -STOP_LOSS_BPS
-            or bars_held >= MAX_HOLD_BARS
+            gain_bps >= TAKE_BPS
+            or gain_bps <= -STOP_BPS
+            or self.bars_held >= MAX_HOLD_BARS
         ):
             return [{
                 "side": "sell",
                 "symbol": SYMBOL,
                 "qty": held.qty,
-                "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                "max_slippage_bps": CAP_BPS,
             }]
         return []
 
-    return on_batch
 
+strategy = Strategy()
 
-makefun_bars.run(make_strategy())
+if __name__ == '__main__':
+    makefun_bars.run(strategy.on_batch)
