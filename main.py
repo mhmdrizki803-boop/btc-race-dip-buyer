@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars  # noqa: E402
 
+# risk: one open position, no leverage, stop 0.45%
 SYMBOL = "CBBTC"
 LOOKBACK_BARS = 60
 DIP_BPS = 250
